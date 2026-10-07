@@ -26,6 +26,9 @@ import {
 const rooms = new Map<string, Room>();
 const ROOM_TTL_MS = 12 * 60 * 60 * 1000;
 const CANDIDATE_LIMIT = 100;
+const MAX_ROOMS = Number(process.env.MAX_ROOMS || 500);
+/** AI requests allowed per round (guess judging, questions, hints, dedupe). */
+const AI_CALLS_PER_ROUND = Number(process.env.AI_CALLS_PER_ROUND || 40);
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
@@ -41,7 +44,7 @@ export const DEFAULT_SETTINGS: Settings = {
   freeQuestions: 0,
 };
 
-export type SettingsInput = { [K in keyof Settings]?: unknown } & { apiKey?: unknown };
+export type SettingsInput = { [K in keyof Settings]?: unknown } & { apiKey?: unknown; aiPassword?: unknown };
 
 function oneOf<T extends string>(value: unknown, options: readonly T[]): value is T {
   return options.includes(value as T);
@@ -85,13 +88,25 @@ export class GameError extends Error {
   }
 }
 
-export function createRoom(input: SettingsInput = {}): Room {
-  const settings = sanitizeSettings(input);
-  const apiKey = typeof input.apiKey === 'string' && input.apiKey.trim() ? input.apiKey.trim() : null;
-  if (settings.moderator === 'ai' && !ai.aiAvailable({ provider: settings.aiProvider, apiKey })) {
+/** Check that switching to an AI moderator is allowed; returns whether the server key may be used. */
+function authorizeAI(settings: Settings, apiKey: string | null, input: SettingsInput, alreadyAuthorized: boolean): boolean {
+  const authorized = alreadyAuthorized || (input.aiPassword !== undefined && ai.checkAIPassword(input.aiPassword)) || !ai.aiPasswordRequired();
+  if (settings.moderator !== 'ai') return authorized;
+  if (!ai.aiAvailable({ provider: settings.aiProvider, apiKey })) {
     throw new GameError(`The AI moderator needs a ${settings.aiProvider === 'openai' ? 'OpenAI' : 'Claude'} API key`);
   }
-  const room = new Room(newCode(), settings, apiKey);
+  if (!apiKey && !authorized) {
+    throw new GameError(input.aiPassword ? 'Wrong AI password' : 'Enter the AI password (or your own API key)', 403);
+  }
+  return authorized;
+}
+
+export function createRoom(input: SettingsInput = {}): Room {
+  if (rooms.size >= MAX_ROOMS) throw new GameError('The server is full right now — try again later', 503);
+  const settings = sanitizeSettings(input);
+  const apiKey = typeof input.apiKey === 'string' && input.apiKey.trim() ? input.apiKey.trim() : null;
+  const aiAuthorized = authorizeAI(settings, apiKey, input, false);
+  const room = new Room(newCode(), settings, apiKey, aiAuthorized);
   rooms.set(room.code, room);
   return room;
 }
@@ -130,6 +145,7 @@ interface Round {
   pending: Pending[];
   log: LogEntry[];
   busy: boolean;
+  aiCalls: number;
 }
 
 export interface Listener {
@@ -154,6 +170,8 @@ export class Room {
     readonly code: string,
     public settings: Settings,
     private apiKey: string | null,
+    /** May this room use the server's own AI key? */
+    private aiAuthorized: boolean,
   ) {}
 
   get aiCfg(): ai.AIConfig {
@@ -161,7 +179,21 @@ export class Room {
   }
 
   get hasAI(): boolean {
-    return ai.aiAvailable(this.aiCfg);
+    return ai.aiAvailable(this.aiCfg) && (Boolean(this.apiKey) || this.aiAuthorized);
+  }
+
+  /** Spend one AI call from this round's budget; false when it's used up. */
+  private spendAI(r: Round): boolean {
+    if (!this.hasAI) return false;
+    if (r.aiCalls >= AI_CALLS_PER_ROUND) {
+      if (r.aiCalls === AI_CALLS_PER_ROUND) {
+        r.aiCalls++; // only announce once
+        this.log('system', 'The AI moderator is out of juice for this round: guesses are judged by spelling, hints are built-in.');
+      }
+      return false;
+    }
+    r.aiCalls++;
+    return true;
   }
 
   isMod(token: unknown): boolean {
@@ -246,6 +278,7 @@ export class Room {
   // -- rounds -------------------------------------------------------------
 
   async newRound(letters?: unknown): Promise<void> {
+    if (this.round?.status === 'loading') throw new GameError('Already fetching letters, hang on');
     const custom = typeof letters === 'string' ? letters.trim().toLowerCase() : '';
     if (custom && !/^\p{L}{1,3}$/u.test(custom)) throw new GameError('Letters must be 1–3 letters');
     const id = ++this.roundCounter;
@@ -268,6 +301,7 @@ export class Room {
       pending: [],
       log: [],
       busy: false,
+      aiCalls: 0,
     };
     this.round = round;
     this.changed();
@@ -287,7 +321,7 @@ export class Room {
         throw new GameError(`Only ${entries.length} results for "${pair.toUpperCase()}" — try other letters`);
       }
 
-      if (s.moderator === 'ai' && this.hasAI && s.dedupe !== 'off') {
+      if (s.moderator === 'ai' && s.dedupe !== 'off' && this.spendAI(round)) {
         try {
           const top = entries.slice(0, Math.min(entries.length, s.zone + 15));
           const groups = await ai.suggestMerges(this.aiCfg, { letters: pair, entries: top });
@@ -417,6 +451,13 @@ export class Room {
       this.applyVerdict(guess, by, sug.verdict, sug.rank);
       return this.changed();
     }
+    if (!this.spendAI(r)) {
+      // Out of AI budget: trust the matcher, including partial matches.
+      if (sug.rank) this.applyVerdict(guess, by, sug.verdict as Verdict, sug.rank);
+      else if (!startsWithLetters(guess, r.letters)) this.log('info', `"${guess}" doesn't start with ${r.letters.toUpperCase()} — no penalty, try again.`, { by });
+      else this.applyVerdict(guess, by, 'womp', null);
+      return this.changed();
+    }
 
     r.busy = true;
     this.changed();
@@ -468,6 +509,7 @@ export class Room {
       return this.changed();
     }
     if (r.busy) throw new GameError('Hang on, the moderator is thinking…');
+    if (!this.spendAI(r)) throw new GameError('The AI has answered all the questions it can this round');
     if (!free) r.questions--;
     r.busy = true;
     this.changed();
@@ -489,6 +531,9 @@ export class Room {
   private recordAnswer(q: string, by: string | null, verdict: QuestionVerdict, explanation: string, charged: boolean): void {
     const r = this.round!;
     const refund = verdict === 'too direct' || verdict === 'not yes/no';
+    // The AI's explanation must not give away a hidden answer, whatever the
+    // players typed into their question.
+    if (explanation && leaksAnswer(explanation, this.hiddenTargets(r))) explanation = '';
     if (refund && charged) r.questions++;
     r.qa.push({ q, a: verdict });
     this.log('answer', q, {
@@ -519,8 +564,7 @@ export class Room {
     const prev = r.hints[target.rank] ?? [];
 
     let text: string | undefined;
-    if (this.settings.moderator === 'ai' && this.hasAI && prev.length < 2) {
-      if (r.busy) throw new GameError('Hang on, the moderator is thinking…');
+    if (this.settings.moderator === 'ai' && prev.length < 2 && !r.busy && this.spendAI(r)) {
       r.busy = true;
       this.changed();
       try {
@@ -611,9 +655,7 @@ export class Room {
   updateSettings(input: SettingsInput): void {
     const next = sanitizeSettings(input, this.settings);
     const apiKey = typeof input.apiKey === 'string' && input.apiKey.trim() ? input.apiKey.trim() : this.apiKey;
-    if (next.moderator === 'ai' && !ai.aiAvailable({ provider: next.aiProvider, apiKey })) {
-      throw new GameError('The AI moderator needs an API key');
-    }
+    this.aiAuthorized = authorizeAI(next, apiKey, input, this.aiAuthorized);
     this.apiKey = apiKey;
     // Pending items only make sense with a human moderator.
     if (next.moderator === 'ai' && this.round) {
@@ -623,6 +665,18 @@ export class Room {
     this.settings = next;
     this.changed();
   }
+}
+
+/** Does the text mention a hidden answer's title or a distinctive word of it? */
+export function leaksAnswer(text: string, hidden: Entry[]): boolean {
+  const t = ` ${normalize(text)} `;
+  return hidden.some((e) =>
+    [e.title, ...e.members].some((name) => {
+      const n = normalize(name);
+      if (n.length >= 3 && t.includes(` ${n} `)) return true;
+      return n.split(' ').some((w) => w.length >= 5 && t.includes(` ${w} `));
+    }),
+  );
 }
 
 function cleanName(by: unknown): string | null {

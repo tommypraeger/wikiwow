@@ -143,6 +143,8 @@ details > summary { cursor: pointer; font-weight: 600; min-height: 32px; list-st
   border: 1px solid var(--line); background: var(--surface);
   border-radius: 999px; padding: 4px 10px; font-size: 0.85rem; font-weight: 600;
 }
+.chip.warn { background: var(--what-bg); color: var(--what); border-color: var(--what); }
+.warn-text { display: block; margin-top: 4px; font-size: 0.8rem; color: var(--what); }
 .chip.mod { background: var(--navy); color: #fff; border-color: var(--navy); }
 
 .letters { display: flex; justify-content: center; gap: 10px; margin: 8px 0 12px; }

@@ -137,6 +137,8 @@ export interface RoomView {
 
 export interface ServerConfig {
   providers: Record<AIProvider, boolean>;
+  /** Using the server's AI keys requires a password. */
+  aiPasswordRequired: boolean;
   defaults: Settings;
 }
 
@@ -153,4 +155,4 @@ export type Action =
   | { type: 'undoWomp'; id: number }
   | { type: 'revealOne' }
   | { type: 'giveUp' }
-  | { type: 'settings'; settings: Partial<Settings> & { apiKey?: string } };
+  | { type: 'settings'; settings: Partial<Settings> & { apiKey?: string; aiPassword?: string } };

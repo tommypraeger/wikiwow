@@ -70,13 +70,26 @@ Autocomplete is noisy, so results are merged before ranking. The **Basic** mode 
 
 **Aggressive** also merges whole-word prefixes ("Abu Ghraib" / "Abu Ghraib prison"). **Off** uses the raw list.
 
+## Security
+
+The game has no accounts, so anyone with a game code can join it and use the house rules. Everything else is locked down:
+
+- **AI password.** Set `AI_PASSWORD` and nobody can use the server's AI keys without it. Players can still bring their own key. The server warns at startup if a key is set on a public interface without a password.
+- **AI budget.** Each round gets `AI_CALLS_PER_ROUND` AI requests (default 40). After that, guesses are judged by spelling, hints are built-in, and questions stop.
+- **Rate limits per IP.** 5 new games per 10 minutes, bursts of 30 actions, and throttled lookups so game codes can't be brute-forced. Behind a proxy, set `TRUST_PROXY=1` so limits use the real client IP.
+- **Caps** on games (`MAX_ROOMS`), live connections (`MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_ROOM`), and the Wikipedia request queue.
+- **Moderator token** is sent in an `X-Mod-Token` header, never in a URL. The live-update stream is read with `fetch()` for this reason.
+- **Headers:** a strict Content-Security-Policy (scripts and styles from this site only, images from Wikimedia), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`.
+- **AI answers are filtered.** Player text is wrapped as data in the prompt, and an explanation that mentions a hidden title is dropped before it reaches the feed.
+- **Use HTTPS** for any public deploy. The UI warns before you paste a key over plain HTTP.
+
 ## Deploying
 
 The server is a single Node process with no database. Games live in memory and expire after 12 idle hours. Any host that runs Node 20+ or Docker will work:
 
 ```sh
 docker build -t wikiwow .
-docker run -p 3000:3000 -e ANTHROPIC_API_KEY=... -e WIKI_CONTACT=you@example.com wikiwow
+docker run -p 3000:3000 -e ANTHROPIC_API_KEY=... -e AI_PASSWORD=... -e WIKI_CONTACT=you@example.com wikiwow
 ```
 
 Live updates use Server-Sent Events. If you put nginx in front, the server already sends `X-Accel-Buffering: no`. Because games are in memory, run a single instance, or add sticky sessions before scaling out.
@@ -89,6 +102,7 @@ src/lib/wiki.ts      Wikipedia client: queue, cache, dedupe, letter pairs
 src/lib/match.ts     fuzzy guess matching
 src/lib/game.ts      rooms, rounds, verdicts, house rules
 src/lib/ai.ts        AI moderator (Claude via @anthropic-ai/sdk, or OpenAI)
+src/lib/ratelimit.ts per-IP token buckets
 src/shared/types.ts  types shared by server and client
 src/client/          React UI (bundled by esbuild into public/app.js)
 public/              index.html, style.css

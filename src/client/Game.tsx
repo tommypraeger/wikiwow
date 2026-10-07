@@ -10,7 +10,7 @@ import {
   type Settings,
   type Slot,
 } from '../shared/types';
-import { api, ApiError, navigate, share, store, toast, usePlayerName } from './util';
+import { api, isPlainHttp, navigate, share, store, toast, usePlayerName } from './util';
 
 type Act = (a: Action) => Promise<boolean>;
 
@@ -28,19 +28,51 @@ function useRoom(code: string) {
     return store.get(`mod:${code}`) || '';
   });
 
+  const [connected, setConnected] = useState(true);
+
+  // Server-Sent Events read through fetch() rather than EventSource, so the
+  // moderator token can travel in a header instead of the URL.
   useEffect(() => {
-    const es = new EventSource(`/api/rooms/${code}/events${modToken ? `?mod=${encodeURIComponent(modToken)}` : ''}`);
-    es.onmessage = (e) => setView(JSON.parse(e.data));
-    es.onerror = () => {
-      // EventSource reconnects on its own; just detect a game that is gone.
-      api(`/api/rooms/${code}`).catch((err) => {
-        if (err instanceof ApiError && err.status === 404) {
-          es.close();
-          setMissing(true);
+    const ctrl = new AbortController();
+    (async () => {
+      let delay = 1000;
+      while (!ctrl.signal.aborted) {
+        try {
+          const res = await fetch(`/api/rooms/${code}/events`, {
+            headers: modToken ? { 'X-Mod-Token': modToken } : {},
+            signal: ctrl.signal,
+          });
+          if (res.status === 404) return setMissing(true);
+          if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+          setConnected(true);
+          delay = 1000;
+          const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+          let buf = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += value;
+            let i;
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              const event = buf.slice(0, i);
+              buf = buf.slice(i + 2);
+              const data = event
+                .split('\n')
+                .filter((l) => l.startsWith('data: '))
+                .map((l) => l.slice(6))
+                .join('\n');
+              if (data) setView(JSON.parse(data));
+            }
+          }
+        } catch {
+          if (ctrl.signal.aborted) return;
         }
-      });
-    };
-    return () => es.close();
+        setConnected(false);
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 15000);
+      }
+    })();
+    return () => ctrl.abort();
   }, [code, modToken]);
 
   const act: Act = useCallback(
@@ -56,11 +88,11 @@ function useRoom(code: string) {
     [code, modToken],
   );
 
-  return { view, missing, act, modToken };
+  return { view, missing, connected, act, modToken };
 }
 
 export function Game({ code }: { code: string }) {
-  const { view, missing, act, modToken } = useRoom(code);
+  const { view, missing, connected, act, modToken } = useRoom(code);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [name] = usePlayerName();
 
@@ -101,6 +133,7 @@ export function Game({ code }: { code: string }) {
         </button>
         {view?.isMod && <span className="chip mod">Moderator</span>}
         {view?.settings.moderator === 'ai' && <span className="chip">🤖 AI mod</span>}
+        {!connected && <span className="chip warn">reconnecting…</span>}
         <span className="spacer" />
         <button className="icon ghost" aria-label="House rules and settings" onClick={() => setSheetOpen(true)} disabled={!view}>
           ☰
@@ -615,6 +648,7 @@ function Sheet({
   const active = Boolean(r && (r.status === 'playing' || r.status === 'lost'));
   const [s, setS] = useState(view.settings);
   const [apiKey, setApiKey] = useState('');
+  const [aiPassword, setAiPassword] = useState('');
   const [say, setSay] = useState('');
   const [customLetters, setCustomLetters] = useState('');
   const doAndClose = async (a: Action) => {
@@ -695,7 +729,7 @@ function Sheet({
           className="stack"
           onSubmit={async (e) => {
             e.preventDefault();
-            if (await act({ type: 'settings', settings: { ...s, apiKey: apiKey || undefined } })) {
+            if (await act({ type: 'settings', settings: { ...s, apiKey: apiKey || undefined, aiPassword: aiPassword || undefined } })) {
               toast('Settings saved');
               onClose();
             }
@@ -718,6 +752,14 @@ function Sheet({
                 </select>
                 <input type="password" placeholder="API key" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
               </div>
+              <input
+                type="password"
+                placeholder="…or the server's AI password"
+                autoComplete="off"
+                value={aiPassword}
+                onChange={(e) => setAiPassword(e.target.value)}
+              />
+              {isPlainHttp() && <span className="warn-text">This connection isn’t encrypted. Only paste a key on a network you trust.</span>}
             </label>
           )}
           <div className="grid2">

@@ -6,13 +6,47 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRoom, getRoom, GameError, DEFAULT_SETTINGS, type Room } from './lib/game.js';
-import { serverProviders } from './lib/ai.js';
+import { serverProviders, aiPasswordRequired } from './lib/ai.js';
+import { clientIp, take, type Limit } from './lib/ratelimit.js';
 import type { RoomView, ServerConfig } from './shared/types.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 // public/ sits next to src/ and dist/
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+
+// Per-IP rate limits.
+const LIMITS = {
+  create: { capacity: 5, perSecond: 5 / 600 }, // 5 new games per 10 minutes
+  action: { capacity: 30, perSecond: 1 }, // bursts of 30, then 1/s
+  read: { capacity: 30, perSecond: 0.5 }, // joins, reconnects, lookups
+} satisfies Record<string, Limit>;
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 1000);
+const MAX_CONNECTIONS_PER_ROOM = Number(process.env.MAX_CONNECTIONS_PER_ROOM || 50);
+let connections = 0;
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'Content-Security-Policy': [
+    "default-src 'self'",
+    "img-src 'self' data: https://*.wikimedia.org",
+    "connect-src 'self'",
+    "style-src 'self'",
+    "script-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join('; '),
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+};
+
+function rateLimit(req: IncomingMessage, bucket: keyof typeof LIMITS, cost = 1): void {
+  const wait = take(`${bucket}:${clientIp(req)}`, LIMITS[bucket], cost);
+  if (wait) throw Object.assign(new GameError(`Slow down! Try again in ${wait}s`, 429), { retryAfter: wait });
+}
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -62,6 +96,10 @@ function serveStatic(res: ServerResponse, pathname: string): void {
 }
 
 function events(req: IncomingMessage, res: ServerResponse, room: Room, isMod: boolean): void {
+  if (connections >= MAX_CONNECTIONS || room.listeners.size >= MAX_CONNECTIONS_PER_ROOM) {
+    throw new GameError('Too many people connected right now', 503);
+  }
+  connections++;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
@@ -72,6 +110,7 @@ function events(req: IncomingMessage, res: ServerResponse, room: Room, isMod: bo
   const unsubscribe = room.subscribe({ send, isMod });
   const ping = setInterval(() => res.write(': ping\n\n'), 25000);
   req.on('close', () => {
+    connections--;
     clearInterval(ping);
     unsubscribe();
   });
@@ -121,31 +160,44 @@ async function action(room: Room, body: Body, isMod: boolean): Promise<void> {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://x');
   const parts = url.pathname.split('/').filter(Boolean);
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
   try {
     if (parts[0] !== 'api') return serveStatic(res, url.pathname);
 
     // GET /api/config
     if (parts[1] === 'config' && req.method === 'GET') {
-      const config: ServerConfig = { providers: serverProviders(), defaults: DEFAULT_SETTINGS };
+      const config: ServerConfig = { providers: serverProviders(), aiPasswordRequired: aiPasswordRequired(), defaults: DEFAULT_SETTINGS };
       return sendJSON(res, 200, config);
     }
     // POST /api/rooms
     if (parts[1] === 'rooms' && parts.length === 2 && req.method === 'POST') {
+      rateLimit(req, 'create');
       const body = await readBody(req);
       const room = createRoom(body);
       room.newRound(body.letters).catch((err) => console.error(err));
       return sendJSON(res, 201, { code: room.code, modToken: room.modToken });
     }
     if (parts[1] === 'rooms' && parts[2]) {
-      const room = getRoom(parts[2]);
-      const token = url.searchParams.get('mod') || req.headers['x-mod-token'];
+      const isAction = parts[3] === 'action' && req.method === 'POST';
+      rateLimit(req, isAction ? 'action' : 'read');
+      let room: Room;
+      try {
+        room = getRoom(parts[2]);
+      } catch (err) {
+        // Make guessing game codes expensive.
+        take(`read:${clientIp(req)}`, LIMITS.read, 5);
+        throw err;
+      }
+      // The moderator token travels in a header only, so it never ends up in
+      // URLs or proxy logs.
+      const token = req.headers['x-mod-token'];
       const isMod = room.isMod(token);
       // GET /api/rooms/:code/events
       if (parts[3] === 'events' && req.method === 'GET') return events(req, res, room, isMod);
       // GET /api/rooms/:code
       if (!parts[3] && req.method === 'GET') return sendJSON(res, 200, room.view(isMod));
       // POST /api/rooms/:code/action
-      if (parts[3] === 'action' && req.method === 'POST') {
+      if (isAction) {
         await action(room, await readBody(req), isMod);
         return sendJSON(res, 200, { ok: true });
       }
@@ -154,6 +206,8 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     if (!(err instanceof GameError)) console.error(err);
     const status = err instanceof GameError ? err.status : 500;
+    const retryAfter = (err as { retryAfter?: number }).retryAfter;
+    if (retryAfter) res.setHeader('Retry-After', String(retryAfter));
     if (!res.headersSent) sendJSON(res, status, { error: err instanceof GameError ? err.message : 'Server error' });
   }
 });
@@ -162,4 +216,8 @@ server.listen(PORT, HOST, () => {
   const p = serverProviders();
   console.log(`WikiWow running at http://localhost:${PORT}`);
   console.log(`AI moderator keys on server: Claude ${p.claude ? '✓' : '✗'}  OpenAI ${p.openai ? '✓' : '✗'}`);
+  const loopback = ['127.0.0.1', '::1', 'localhost'].includes(HOST);
+  if ((p.claude || p.openai) && !aiPasswordRequired() && !loopback) {
+    console.warn('⚠️  The server AI key is usable by anyone who can reach this server. Set AI_PASSWORD to protect it.');
+  }
 });

@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import type { ServerConfig, Settings } from '../shared/types';
-import { api, navigate, store, toast, usePlayerName } from './util';
+import { api, isPlainHttp, navigate, store, toast, usePlayerName } from './util';
 
 const FALLBACK: Settings = {
   moderator: 'human',
@@ -55,6 +55,7 @@ export function Home({ config }: { config: ServerConfig | null }) {
   const [letterChoice, setLetterChoice] = useState<'random' | 'custom'>('random');
   const [letters, setLetters] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [aiPassword, setAiPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const set = <K extends keyof Settings>(k: K, v: Settings[K]) =>
     setS((prev) => {
@@ -78,7 +79,7 @@ export function Home({ config }: { config: ServerConfig | null }) {
     try {
       store.set('lastSettings', JSON.stringify(s));
       const res = await api<{ code: string; modToken: string }>('/api/rooms', {
-        json: { ...s, letters: letterChoice === 'custom' ? letters.trim() : '', apiKey: apiKey.trim() || undefined },
+        json: { ...s, letters: letterChoice === 'custom' ? letters.trim() : '', apiKey: apiKey.trim() || undefined, aiPassword: aiPassword || undefined },
       });
       store.set(`mod:${res.code}`, res.modToken);
       navigate(`/r/${res.code}`);
@@ -150,10 +151,17 @@ export function Home({ config }: { config: ServerConfig | null }) {
                   ['openai', `ChatGPT${providers.openai ? ' ✓' : ''}`],
                 ]}
               />
-              {!providers[s.aiProvider] && (
+              {providers[s.aiProvider] && config?.aiPasswordRequired && !apiKey && (
                 <label className="field">
-                  <span>API key (kept in server memory for this game only)</span>
+                  <span>AI password (ask whoever runs this server)</span>
+                  <input type="password" autoComplete="off" value={aiPassword} onChange={(e) => setAiPassword(e.target.value)} />
+                </label>
+              )}
+              {(!providers[s.aiProvider] || config?.aiPasswordRequired) && (
+                <label className="field">
+                  <span>{providers[s.aiProvider] ? '…or your own API key' : 'API key (kept in server memory for this game only)'}</span>
                   <input type="password" autoComplete="off" placeholder="sk-…" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+                  {isPlainHttp() && <span className="warn-text">This connection isn’t encrypted. Only paste a key on a network you trust.</span>}
                 </label>
               )}
             </div>

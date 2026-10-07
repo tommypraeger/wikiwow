@@ -104,3 +104,8 @@ export function usePlayerName(): [string, (n: string) => void] {
     },
   ];
 }
+
+/** True when keys would travel unencrypted to a non-local server. */
+export function isPlainHttp(): boolean {
+  return location.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+}
