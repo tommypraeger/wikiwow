@@ -1,0 +1,37 @@
+{
+  "name": "wikiwow",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm run build:client && concurrently -k -n server,client \"tsx watch --env-file-if-exists=.env src/server.ts\" \"npm run build:client -- --watch=forever\"",
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "esbuild src/client/main.tsx --bundle --format=esm --target=es2020 --jsx=automatic --minify --sourcemap --define:process.env.NODE_ENV='\"production\"' --outfile=public/app.js",
+    "build:server": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "description": "WikiWow: guess the top Wikipedia autocomplete results for two letters",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "openai": "^7.30.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "concurrently": "^10.0.5",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "private": true
+}

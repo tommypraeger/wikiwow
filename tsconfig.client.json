@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "types": [],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src/client",
+    "src/shared"
+  ],
+  "exclude": []
+}
